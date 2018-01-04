@@ -1,5 +1,7 @@
+import DetectEngine from 'appcd-detect';
 import gawk from 'gawk';
-import windowslib from 'windowslib';
+import * as windowslib from 'windowslib';
+import * as registry from 'appcd-winreg';
 
 import { DataServiceDispatcher } from 'appcd-dispatcher';
 import { get } from 'appcd-util';
@@ -18,28 +20,109 @@ export default class WindowsInfoService extends DataServiceDispatcher {
 	 */
 	async activate(cfg) {
 		this.data = gawk({
-			devices: [],
-			emulators: {},
-			windows: {},
-			visualstudio: {},
-			windowsphone: {},
-			selectedVisualStudio: {}
+			sdk: [],
+			visualstudio: {}
 		});
 
 		this.timers = {};
 
-		// wire up Visual Studio detection first so that we can use its result to know if we should query the other thing
-		await this.wireupDetection('visualstudio', get(cfg, 'windows.visualstudio.pollInterval') || 60000 * 10, () => this.detectVisualStudios());
+		// // wire up Visual Studio detection first so that we can use its result to know if we should query the other thing
+		// await this.wireupDetection('visualstudio', get(cfg, 'windows.visualstudio.pollInterval') || 60000 * 10, () => this.detectVisualStudios());
+		//
+		// await Promise.all([
+		// 	this.wireupDetection('emulators',      get(cfg, 'windows.emulators.pollInterval')    || 60000 * 5,  () => this.detectEmulators()),
+		// 	this.wireupDetection('windows',        get(cfg, 'windows.windowsSDK.pollInterval')   || 60000 / 2,  () => this.detectWindowsSDKs()),
+		// 	this.wireupDetection('windowsphone',   get(cfg, 'windows.windowsPhone.pollInterval') || 60000 / 2,  () => this.detectWindowsPhone())
+		// ]);
+		//
+		// // wire up devices after the rest to avoid DAEMON-173 where emulator and
+		// // device detect functions attempt to build and write wptool at the same time
+		// await this.wireupDetection('devices',      get(cfg, 'windows.device.pollInterval')       || 2500,       () => this.detectDevices());
 
-		await Promise.all([
-			this.wireupDetection('emulators',      get(cfg, 'windows.emulators.pollInterval')    || 60000 * 5,  () => this.detectEmulators()),
-			this.wireupDetection('windows',        get(cfg, 'windows.windowsSDK.pollInterval')   || 60000 / 2,  () => this.detectWindowsSDKs()),
-			this.wireupDetection('windowsphone',   get(cfg, 'windows.windowsPhone.pollInterval') || 60000 / 2,  () => this.detectWindowsPhone())
-		]);
+		await this.initSDK();
+		await this.initVS();
+	}
 
-		// wire up devices after the rest to avoid DAEMON-173 where emulator and
-		// device detect functions attempt to build and write wptool at the same time
-		await this.wireupDetection('devices',      get(cfg, 'windows.device.pollInterval')       || 2500,       () => this.detectDevices());
+	async initSDK() {
+
+		this.sdkDetectEngine = new DetectEngine({
+			checkDir(dir) {
+				try {
+					return new windowslib.SDK(dir);
+				} catch (e) {
+					// Do nothing
+					console.log(e);
+				}
+			},
+			registryCallback: async () => {
+				const results = {
+					paths: []
+				};
+				const sdkInstalls = await registry.keys('HKLM', 'SOFTWARE\\WOW6432Node\\Microsoft\\Microsoft SDKs\\Windows');
+				for (const key of sdkInstalls) {
+					try {
+						const value = await registry.get('HKLM', key, 'InstallationFolder');
+						results.paths.push(value);
+					} catch (e) {
+						// Do nothing
+					}
+				}
+				return results;
+			},
+			processResults: async (results, engine) => {
+				// loop over all of the new sdks and set default version
+				if (results.length) {
+					let foundDefault = false;
+					for (const result of results) {
+						if (!foundDefault && (!engine.defaultPath || result.path === engine.defaultPath)) {
+							result.default = true;
+							foundDefault = true;
+						} else {
+							result.default = false;
+						}
+					}
+
+					if (!foundDefault) {
+						// since sdks aren't in any particular order, the first one is a good one
+						results[0].default = true;
+					}
+				}
+			},
+			redetect: true,
+			watch: true,
+			depth: 1,
+			multiple: true
+		});
+
+		this.sdkDetectEngine.on('results', results => {
+			gawk.set(this.data.sdk, results);
+		});
+
+		await this.sdkDetectEngine.start();
+	}
+
+	async initVS() {
+		let	vswhere = await windowslib.vswhere.getVSWhere();
+		if (vswhere) {
+			try {
+				const { code, stdout, stderr } = await vswhere.detect();
+				if (!code) {
+					const visualStudios = {};
+					const visualStudioData = JSON.parse(stdout);
+					for (const vs of visualStudioData) {
+						try {
+							const visualStudio = new windowslib.VisualStudio(vs);
+							visualStudios[vs.installationVersion] = visualStudio;
+						} catch (e) {
+							console.log(e);
+						}
+					}
+					gawk.set(this.data.visualstudio, visualStudios);
+				}
+			} catch (e) {
+				console.log(e);
+			}
+		}
 	}
 
 	/**
